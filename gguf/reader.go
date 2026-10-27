@@ -182,7 +182,21 @@ func (f *File) parse() error {
 	}
 
 	f.alignment = DefaultAlignment
-	if v, ok := f.Uint("general.alignment"); ok && v > 0 {
+	if v, ok := f.Uint("general.alignment"); ok {
+		// A corrupt or hostile alignment must be rejected, never trusted.
+		// It is used as a power-of-two mask for padding and as a divisor, so
+		// non-power-of-two or absurd values would overflow the int64 padding
+		// arithmetic further down (2^63 wraps negative and defeats the
+		// '> size' bounds check, then panics on slicing).
+		if v == 0 {
+			return fmt.Errorf("general.alignment is zero")
+		}
+		if v > 1<<20 {
+			return fmt.Errorf("general.alignment %d is implausibly large (max %d)", v, 1<<20)
+		}
+		if v&(v-1) != 0 {
+			return fmt.Errorf("general.alignment %d is not a power of two", v)
+		}
 		f.alignment = v
 	}
 
@@ -229,13 +243,15 @@ func (f *File) parse() error {
 	}
 
 	// The tensor-data section starts at the next alignment boundary after
-	// the tensor-info table.
-	pos := consumed
-	pad := (f.alignment - uint64(pos)%f.alignment) % uint64(f.alignment)
-	f.dataStart = pos + int64(pad)
-	if f.dataStart > size {
-		return fmt.Errorf("%w: data section starts at %d, file is %d bytes", ErrTruncated, f.dataStart, size)
+	// the tensor-info table. Computed in uint64 and bounded before narrowing to
+	// int64 so no overflow can reach the slice expression below.
+	pos := uint64(consumed)
+	pad := (f.alignment - pos%f.alignment) % f.alignment
+	start := pos + pad
+	if start < pos || start > uint64(size) {
+		return fmt.Errorf("%w: data section starts at %d, file is %d bytes", ErrTruncated, start, size)
 	}
+	f.dataStart = int64(start)
 
 	// Validate every tensor fits inside the file.
 	dataLen := size - f.dataStart

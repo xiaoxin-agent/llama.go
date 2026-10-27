@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -250,5 +251,60 @@ func TestTypeSize(t *testing.T) {
 		} else if got != c.want {
 			t.Errorf("TypeSize(%s,%d) = %d, want %d", c.t, c.n, got, c.want)
 		}
+	}
+}
+
+// TestAlignmentValidation covers hostile and malformed general.alignment
+// values. A bad alignment must be rejected, never used in arithmetic: a value
+// like 2^63 overflows int64 padding and used to panic on slicing.
+func TestAlignmentValidation(t *testing.T) {
+	cases := []struct {
+		align  uint64
+		reject bool
+	}{
+		{1 << 63, true},
+		{^uint64(0), true},
+		{1 << 40, true},
+		{48, true}, // not a power of two
+		{0, true},
+		{32, false},
+		{16, false},
+		{64, false},
+	}
+	for _, c := range cases {
+		var buf bytes.Buffer
+		w := NewWriter(&buf)
+		w.WriteMagic()
+		w.WriteVersion(3)
+		w.WriteUint64(0)
+		w.WriteUint64(1)
+		w.WriteString("general.alignment")
+		w.WriteUint32(uint32(ValUint64))
+		w.WriteUint64(c.align)
+		w.WriteRaw(make([]byte, 64)) // room for alignment padding
+		p := filepath.Join(t.TempDir(), "align.gguf")
+		if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("alignment %d panicked: %v", c.align, r)
+				}
+			}()
+			f, err := Open(p)
+			if err == nil {
+				f.Close()
+			}
+			if c.reject && err == nil {
+				t.Errorf("alignment %d: accepted, want rejection", c.align)
+			}
+			if !c.reject && err != nil {
+				t.Errorf("alignment %d: rejected (%v), want accepted", c.align, err)
+			}
+			if c.reject && err != nil && !strings.Contains(err.Error(), "alignment") {
+				t.Errorf("alignment %d: error does not mention alignment: %v", c.align, err)
+			}
+		}()
 	}
 }
