@@ -460,3 +460,117 @@ func TestAlignmentUint32NotTruncated(t *testing.T) {
 		})
 	}
 }
+
+// writeTensorEntry appends one tensor-info record to w.
+func writeTensorEntry(w *Writer, name string, dims []uint64, typ Type, off uint64) {
+	w.WriteString(name)
+	w.WriteUint32(uint32(len(dims)))
+	for _, d := range dims {
+		w.WriteUint64(d)
+	}
+	w.WriteUint32(uint32(typ))
+	w.WriteUint64(off)
+}
+
+// openRaw writes buf as a GGUF file and opens it.
+func openRaw(t *testing.T, buf []byte) (*File, error) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "f.gguf")
+	if err := os.WriteFile(p, buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Open(p)
+}
+
+// headerWithTensorCount writes magic, version 3, the given tensor count and one
+// metadata key, then the tensor entries, padding and payload.
+func ggufWithTensors(t *testing.T, nTensors uint64, entries func(w *Writer), payload int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.WriteMagic()
+	w.WriteVersion(3)
+	w.WriteUint64(nTensors)
+	w.WriteUint64(0) // no metadata
+	entries(w)
+	w.WritePadding(32)
+	w.WriteRaw(make([]byte, payload))
+	if err := w.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestZeroDimsRejected ensures a tensor declaring no dimensions is refused.
+// A zero-dimensional tensor describes a single scalar and cannot correspond to
+// any real weight, so accepting it hides a corrupt tensor-info table.
+func TestZeroDimsRejected(t *testing.T) {
+	buf := ggufWithTensors(t, 1, func(w *Writer) {
+		writeTensorEntry(w, "w", nil, TypeF32, 0)
+	}, 64)
+	f, err := openRaw(t, buf)
+	if err == nil {
+		f.Close()
+		t.Fatal("n_dims=0 accepted, want rejection")
+	}
+	if !strings.Contains(err.Error(), "dimension") {
+		t.Fatalf("error does not mention dimensions: %v", err)
+	}
+	t.Logf("rejected as expected: %v", err)
+}
+
+// TestDimProductOverflowRejected ensures a shape whose element count overflows
+// uint64 is refused. Without the check the product wraps (2^32^3 wraps to 0),
+// the tensor appears to have a zero-byte payload, and every bounds check passes
+// while the file describes something impossible.
+func TestDimProductOverflowRejected(t *testing.T) {
+	buf := ggufWithTensors(t, 1, func(w *Writer) {
+		writeTensorEntry(w, "w", []uint64{1 << 32, 1 << 32, 1 << 32, 1}, TypeF32, 0)
+	}, 64)
+	f, err := openRaw(t, buf)
+	if err == nil {
+		f.Close()
+		t.Fatal("overflowing dims accepted, want rejection")
+	}
+	if !strings.Contains(err.Error(), "overflow") {
+		t.Fatalf("error does not mention overflow: %v", err)
+	}
+	t.Logf("rejected as expected: %v", err)
+}
+
+// TestOverlappingTensorsRejected ensures two tensors claiming the same byte
+// range are refused. Reading through such a file yields legal bytes belonging
+// to a different tensor, which silently produces wrong inference results.
+func TestOverlappingTensorsRejected(t *testing.T) {
+	// Offsets and 32-element strides are both multiples of 32, so the payload
+	// size has to be pushed up before a second tensor can start at a legal
+	// offset while still landing inside the first one. Dims of 32 elements give
+	// a 128-byte f32 payload, so 32 and 64 both fall inside tensor a.
+	buf := ggufWithTensors(t, 2, func(w *Writer) {
+		writeTensorEntry(w, "a", []uint64{32}, TypeF32, 0)  // [0,128)
+		writeTensorEntry(w, "b", []uint64{32}, TypeF32, 64) // [64,192) overlaps a
+	}, 192)
+	f, err := openRaw(t, buf)
+	if err == nil {
+		f.Close()
+		t.Fatal("overlapping tensors accepted, want rejection")
+	}
+	if !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("error does not mention overlap: %v", err)
+	}
+	t.Logf("rejected as expected: %v", err)
+}
+
+// TestAdjacentTensorsAccepted is the opposite direction: payloads that merely
+// touch (end == next start) are legal and must not be rejected.
+func TestAdjacentTensorsAccepted(t *testing.T) {
+	buf := ggufWithTensors(t, 2, func(w *Writer) {
+		writeTensorEntry(w, "a", []uint64{8}, TypeF32, 0)  // [0,32)
+		writeTensorEntry(w, "b", []uint64{8}, TypeF32, 32) // [32,64) adjacent
+	}, 64)
+	f, err := openRaw(t, buf)
+	if err != nil {
+		t.Fatalf("adjacent tensors rejected: %v", err)
+	}
+	f.Close()
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"syscall"
 )
@@ -25,11 +26,26 @@ type TensorInfo struct {
 
 // NBytes returns the size in bytes of the tensor payload given its type.
 func (t TensorInfo) NBytes() (uint64, error) {
-	n := uint64(1)
-	for _, d := range t.Dims {
-		n *= d
+	n, err := t.ElementCountChecked()
+	if err != nil {
+		return 0, err
 	}
 	return TypeSize(t.Type, n)
+}
+
+// ElementCountChecked multiplies the dimensions and reports overflow instead of
+// wrapping. A declared shape like 2^32 x 2^32 x 2^32 wraps to zero elements,
+// which would make a tensor look like a zero-byte payload and pass every bounds
+// check while describing something impossible.
+func (t TensorInfo) ElementCountChecked() (uint64, error) {
+	n := uint64(1)
+	for i, d := range t.Dims {
+		if d != 0 && n > math.MaxUint64/d {
+			return 0, fmt.Errorf("dimension product overflows: dims %v (at dimension %d)", t.Dims, i)
+		}
+		n *= d
+	}
+	return n, nil
 }
 
 // String renders the tensor for diagnostics.
@@ -214,6 +230,9 @@ func (f *File) parse() error {
 		if err := read(&nDims); err != nil {
 			return err
 		}
+		if nDims == 0 {
+			return fmt.Errorf("tensor %q: %d dimensions, want at least 1", name, nDims)
+		}
 		if nDims > 4 {
 			return fmt.Errorf("tensor %q: %d dimensions, max 4", name, nDims)
 		}
@@ -276,6 +295,15 @@ func (f *File) parse() error {
 		if ti.Offset > uint64(dataLen) || n > uint64(dataLen)-ti.Offset {
 			return fmt.Errorf("tensor %q: payload [%d,+%d) exceeds data section (%d bytes)", name, ti.Offset, n, dataLen)
 		}
+	}
+
+	// Reject tensors whose payloads overlap. Every tensor was already checked
+	// to fit inside the data section, so two payloads that start at the same
+	// offset, or whose ranges are ordered contradictorily, mean the file is
+	// corrupt. Reading through such a file returns legal bytes that belong to
+	// a different tensor, which silently produces wrong results.
+	if err := f.checkNoOverlap(); err != nil {
+		return err
 	}
 
 	// Note: syscall.Mmap on Linux requires a zero offset. Map the whole file
@@ -524,4 +552,33 @@ func (f *File) MetadataKeys() []string {
 func (f *File) Lookup(key string) (Value, bool) {
 	v, ok := f.meta[key]
 	return v, ok
+}
+
+// checkNoOverlap rejects files where two tensor payloads claim overlapping
+// byte ranges in the data section. Tensors are visited in declaration order;
+// each range is compared against every earlier one. The tensor count is small
+// (hundreds at most), so the quadratic scan is not worth optimizing.
+func (f *File) checkNoOverlap() error {
+	type span struct {
+		name string
+		start,
+		end uint64
+	}
+	spans := make([]span, 0, len(f.order))
+	for _, name := range f.order {
+		ti := f.tensors[name]
+		n, err := ti.NBytes()
+		if err != nil {
+			return fmt.Errorf("tensor %q: %w", name, err)
+		}
+		start, end := ti.Offset, ti.Offset+n
+		for _, s := range spans {
+			if start < s.end && s.start < end {
+				return fmt.Errorf("tensor %q payload [%d,%d) overlaps tensor %q payload [%d,%d)",
+					name, start, end, s.name, s.start, s.end)
+			}
+		}
+		spans = append(spans, span{name: name, start: start, end: end})
+	}
+	return nil
 }
