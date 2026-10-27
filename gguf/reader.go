@@ -8,6 +8,8 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -62,7 +64,8 @@ type File struct {
 	tensors   map[string]TensorInfo
 	order     []string // tensor names in file order
 	meta      map[string]Value
-	dataStart int64 // absolute file offset of the tensor-data section
+	metaOrder []string // metadata keys in file order
+	dataStart int64    // absolute file offset of the tensor-data section
 	f         *os.File
 	data      []byte // tensor-data section (mmap-backed, sub-slice of whole)
 	whole     []byte // full-file mapping; the only slice legal for Munmap
@@ -92,6 +95,15 @@ func (v Value) String() string {
 		return v.Str
 	case ValArray:
 		return fmt.Sprintf("array(len=%d)", len(v.Strs)+len(v.Floats)+len(v.Uints)+len(v.Ints)+len(v.Bools))
+	case ValFloat32, ValFloat64:
+		// Always keep a decimal point: a reference dump prints 10000.0, and
+		// printing 10000 would show up as a spurious difference in a line-by-line
+		// comparison even though the parsed value is identical.
+		s := strconv.FormatFloat(v.Float, 'g', -1, 64)
+		if !strings.ContainsAny(s, ".eE") {
+			s += ".0"
+		}
+		return s
 	default:
 		return fmt.Sprintf("%v", v.any())
 	}
@@ -194,7 +206,11 @@ func (f *File) parse() error {
 		if err != nil {
 			return fmt.Errorf("key %q: %w", key, err)
 		}
+		if _, dup := f.meta[key]; dup {
+			return fmt.Errorf("duplicate metadata key %q", key)
+		}
 		f.meta[key] = v
+		f.metaOrder = append(f.metaOrder, key)
 	}
 
 	f.alignment = DefaultAlignment
@@ -285,12 +301,27 @@ func (f *File) parse() error {
 	}
 	for _, name := range f.order {
 		ti := f.tensors[name]
-		n, err := ti.NBytes()
-		if err != nil {
-			return fmt.Errorf("tensor %q: %w", name, err)
-		}
+		// Alignment and bounds are checked for every tensor, including ones
+		// whose element type is not implemented yet: those facts do not depend
+		// on knowing the type. Only the payload size does.
 		if ti.Offset%f.alignment != 0 {
 			return fmt.Errorf("tensor %q: offset %d is not a multiple of alignment %d", name, ti.Offset, f.alignment)
+		}
+		n, err := ti.NBytes()
+		if err != nil {
+			if errors.Is(err, ErrUnknownType) {
+				// Keep the tensor in the table and let the caller decide.
+				// Refusing to open the file would make correctly parsed
+				// metadata unreachable just because one element type is
+				// unimplemented - which is the situation of every real
+				// quantised model, where embeddings stay at Q6_K.
+				//
+				// The payload cannot be bounds-checked, but tensor payloads are
+				// read on demand (ReadRaw) and that path errors on unknown
+				// types, so nothing can read past the data section.
+				continue
+			}
+			return fmt.Errorf("tensor %q: %w", name, err)
 		}
 		if ti.Offset > uint64(dataLen) || n > uint64(dataLen)-ti.Offset {
 			return fmt.Errorf("tensor %q: payload [%d,+%d) exceeds data section (%d bytes)", name, ti.Offset, n, dataLen)
@@ -549,12 +580,19 @@ func (f *File) Tensor(name string) (TensorInfo, bool) {
 	return t, ok
 }
 
-// MetadataKeys returns metadata keys in a stable sorted order.
+// MetadataKeys returns metadata keys in file order.
+//
+// File order matters: it is part of the on-disk format, reference dumps such as
+// gguf_dump emit keys in the same order, and a sorted list cannot be compared
+// line by line against them. Use SortedMetadataKeys when a deterministic
+// ordering independent of the file is wanted.
 func (f *File) MetadataKeys() []string {
-	keys := make([]string, 0, len(f.meta))
-	for k := range f.meta {
-		keys = append(keys, k)
-	}
+	return append([]string(nil), f.metaOrder...)
+}
+
+// SortedMetadataKeys returns metadata keys sorted lexicographically.
+func (f *File) SortedMetadataKeys() []string {
+	keys := append([]string(nil), f.metaOrder...)
 	sortStrings(keys)
 	return keys
 }
@@ -580,7 +618,10 @@ func (f *File) checkNoOverlap() error {
 		ti := f.tensors[name]
 		n, err := ti.NBytes()
 		if err != nil {
-			return fmt.Errorf("tensor %q: %w", name, err)
+			// Unknown element type: the payload size is unknown, so this
+			// tensor cannot participate in an overlap check. Reading it is
+			// already refused by ReadRaw.
+			continue
 		}
 		start, end := ti.Offset, ti.Offset+n
 		for _, s := range spans {
