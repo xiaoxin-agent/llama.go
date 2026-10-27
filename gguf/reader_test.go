@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -306,5 +307,156 @@ func TestAlignmentValidation(t *testing.T) {
 				t.Errorf("alignment %d: error does not mention alignment: %v", c.align, err)
 			}
 		}()
+	}
+}
+
+// TestAlignmentOverflowBoundsCheck drives a file whose tensor-data start would
+// exceed the file size, so the uint64 bounds check at the top of the parse tail
+// is exercised. The alignment value itself is legal, so this path is reachable
+// without any validation help: it is the second layer of defence against a
+// negative dataStart and would otherwise be untested.
+func TestAlignmentOverflowBoundsCheck(t *testing.T) {
+	// One tensor, one dimension of 8 elements of f32 = 32 bytes, but no payload
+	// written. The data section start is aligned past the end of the file.
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.WriteMagic()
+	w.WriteVersion(3)
+	w.WriteUint64(1) // 1 tensor
+	w.WriteUint64(1) // 1 kv
+	w.WriteString("general.alignment")
+	w.WriteUint32(uint32(ValUint32))
+	w.WriteUint32(1048576) // legal maximum, forces a large pad
+	w.WriteString("w")
+	w.WriteUint32(1)                  // n_dims
+	w.WriteUint64(8)                  // dim
+	w.WriteUint32(uint32(ValFloat32)) // type
+	w.WriteUint64(0)                  // offset
+	if err := w.Err(); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "bounds.gguf")
+	if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("panicked instead of returning an error: %v", r)
+			}
+		}()
+		f, err := Open(p)
+		if err == nil {
+			f.Close()
+			t.Fatal("expected error for data section starting past EOF, got nil")
+		}
+		if !strings.Contains(err.Error(), "data section starts at") {
+			t.Fatalf("wrong error, want data-section bounds failure, got: %v", err)
+		}
+		t.Logf("rejected as expected: %v", err)
+	}()
+}
+
+// TestAlignmentZeroPadBoundary ensures a legal alignment that lands exactly on a
+// boundary still parses, i.e. the bounds check does not false-reject.
+func TestAlignmentZeroPadBoundary(t *testing.T) {
+	full := buildAlignedGGUF(t, 32, 0)
+	f, err := Open(full)
+	if err != nil {
+		t.Fatalf("legal file rejected: %v", err)
+	}
+	defer f.Close()
+	if f.Alignment() != 32 {
+		t.Fatalf("alignment = %d, want 32", f.Alignment())
+	}
+}
+
+// buildAlignedGGUF writes a minimal valid file: one f32 tensor of 8 elements,
+// with the given alignment, and pads the payload area so the tensor fits.
+func buildAlignedGGUF(t *testing.T, align uint64, payloadPad int) string {
+	t.Helper()
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.WriteMagic()
+	w.WriteVersion(3)
+	w.WriteUint64(1) // 1 tensor
+	w.WriteUint64(1) // 1 kv
+	w.WriteString("general.alignment")
+	w.WriteUint32(uint32(ValUint32))
+	w.WriteUint32(uint32(align))
+	w.WriteString("w")
+	w.WriteUint32(1) // n_dims
+	w.WriteUint64(8) // dim
+	w.WriteUint32(uint32(TypeF32))
+	w.WriteUint64(0) // offset
+	w.WritePadding(align)
+	w.WriteRaw(make([]byte, 32+payloadPad)) // 8 f32 values
+	if err := w.Err(); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(t.TempDir(), "aligned.gguf")
+	if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestAlignmentUint32NotTruncated ensures a general.alignment stored in a narrow
+// integer type is not silently truncated before validation, which would surface
+// as a misleading "alignment is zero" error instead of the real value.
+func TestAlignmentUint32NotTruncated(t *testing.T) {
+	cases := []struct {
+		name string
+		tag  ValueType
+		val  uint64
+	}{
+		{"uint32 max", ValUint32, 1<<32 - 1},
+		{"uint16 max", ValUint16, 1<<16 - 1},
+		{"uint64 2^40", ValUint64, 1 << 40},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := NewWriter(&buf)
+			w.WriteMagic()
+			w.WriteVersion(3)
+			w.WriteUint64(0) // 0 tensors
+			w.WriteUint64(1) // 1 kv
+			w.WriteString("general.alignment")
+			w.WriteUint32(uint32(c.tag))
+			switch c.tag {
+			case ValUint8:
+				w.write(uint8(c.val))
+			case ValUint16:
+				w.write(uint16(c.val))
+			case ValUint32:
+				w.WriteUint32(uint32(c.val))
+			case ValUint64:
+				w.WriteUint64(c.val)
+			}
+			w.WriteRaw(make([]byte, 64))
+			if err := w.Err(); err != nil {
+				t.Fatal(err)
+			}
+			p := filepath.Join(t.TempDir(), "narrow.gguf")
+			if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			f, err := Open(p)
+			if err == nil {
+				al := f.Alignment()
+				f.Close()
+				if al != c.val {
+					t.Errorf("%s: alignment read back as %d, want %d (truncated)", c.name, al, c.val)
+				}
+				return
+			}
+			want := strconv.FormatUint(c.val, 10)
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: error does not mention the real value %s: %v", c.name, want, err)
+			}
+			t.Logf("%s: rejected with real value: %v", c.name, err)
+		})
 	}
 }
