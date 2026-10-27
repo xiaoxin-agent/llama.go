@@ -16,7 +16,7 @@
 
 | 里程碑 | 计划内容 | 状态 | 说明 |
 |---|---|---|---|
-| M0 环境与参照基线 | Go、脚手架、模型、参考导出 | 🔶 部分完成 | Go 1.23.4 已装；仓库脚手架已提交（`daa7dfe`）；TinyLlama Q4_0 已下载并核验可读。**缺** Python 参考环境、`requirements-ref.txt`、`tools/ref_export.py`、sha256 记录 |
+| M0 环境与参照基线 | Go、脚手架、模型、参考导出 | 🔶 大部分完成（4/6） | Go 1.23.4 已装并验证；`go.mod`/`Makefile`/CI 骨架齐全；两个模型已下载、sha256 已记录（`docs/models.md`）；`requirements-ref.txt` 已写。**缺** Python 参考环境实际安装、`tools/ref_export.py` |
 | M1 GGUF 解析器 | `gguf/` + `cmd/gguf-inspect` | ✅ 门禁已过（2026-10-27 22:00 UTC） | 四条证据全部达成，见下节；`cmd/gguf-inspect` 已建（`886f9cf`） |
 | M2 反量化与张量算子 | `quant/` + `tensor/` | 🔶 只完成 `quant/` | `quant/` 覆盖率 93.9% 并通过逐位比对；`tensor/` 尚未创建；Q6_K 等 K-quant 未支持 |
 | M3 及以后 | — | ⬜ 未开始 | — |
@@ -50,6 +50,37 @@
 
 1. 比较脚本**按行切分**输出，而 `tokenizer.chat_template` 的值内含换行 —— 首行之后全部被丢弃，误判为"字符串在解析阶段被截断"。改成按 key 边界解析后差异立即归零。当时差点去查一个不存在的解析器 bug。
 2. 第一次修浮点格式改在 `Value.any()` 上，返回类型从 `float64` 换成 `string` —— `%v` 对 string 仍原样输出，等于没修。格式化属于 `String()`，不属于 `any()`。
+
+## M0 交付物逐项状态
+
+计划 §7 M0 列出六项交付物。按计划定义，六项全部达成才算完成。
+
+| 交付物 | 状态 | 证据 |
+|---|---|---|
+| `go.mod`、`Makefile`、CI 脚本骨架 | ✅ | `Makefile` 含 `verify` 目标；`.github/workflows/ci.yml` 跑 fmt/vet/test/cover/build |
+| Go ≥1.22（Arm64） | ✅ 变通 | go1.23.4 linux/arm64 已装并可编译；**无独立安装脚本**，直接置于 `$HOME/.local/go` |
+| Python 参考环境 | ❌ 未装 | `torch` / `transformers` / `numpy` 三个包导入均失败 |
+| `requirements-ref.txt` | ✅ | 钉版 torch 2.5.1 / transformers 4.46.3 / numpy 1.26.4，全 CPU |
+| 两个 GGUF + sha256 | ✅ | TinyLlama Q4_0 与 SmolLM2-135M Q8_0 均已下载并核验可解析，校验值见 [`models.md`](models.md) |
+| `tools/ref_export.py` | ❌ 未写 | 目录下无任何 Python 文件 |
+
+### M0 证据
+
+| 证据 | 状态 |
+|---|---|
+| 1 `go version` / `torch.__version__` 实际输出 | Go ✅（`go1.23.4 linux/arm64`）；torch ❌ 未装 |
+| 2 两个 GGUF 的 `sha256sum` | ✅ 均已算，见 [`models.md`](models.md) |
+| 3 `ref_export.py --prompt "Hello"` 产出 4 类文件 | ❌ 脚本不存在 |
+| 4 关闭 §1 待证项 | ❌ 未做 |
+
+### 阻塞 M0 关闭的唯一实质障碍
+
+Python 参考环境（R1）。它同时是 G2–G5、G7 的**唯一**参照来源，因此 M0 不关闭，
+后面的数值门禁就没有判定依据。
+
+实测机器资源：磁盘剩余约 3.1 GB，内存 7 GB（可用约 4 GB）。torch CPU wheel 加依赖
+约 1 GB，装得下但余量很薄。前一次 Reviewer 进程正是因为磁盘满崩溃的
+（`database or disk is full`），装环境前应先清理可重建的缓存。
 
 ## G1–G8 数值门禁
 

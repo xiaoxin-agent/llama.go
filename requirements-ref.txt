@@ -1,0 +1,17 @@
+# Reference environment (R1): CPU-only, pinned.
+#
+# R1 is the authoritative numeric reference for gates G2-G5 and G7.
+# torch pulls numpy transitively, but it is pinned explicitly because the
+# reference export script uses it directly for .npy output.
+#
+# Install:  python3 -m pip install -r requirements-ref.txt
+# CPU wheels only; do not install CUDA builds. On arm64 Linux the default
+# PyPI wheel for these versions is already CPU-only.
+torch==2.5.1
+transformers==4.46.3
+numpy==1.26.4
+
+# Used only to cross-check GGUF metadata against llama.cpp's own dumper.
+# Optional: gate evidence 2 currently uses a self-written parser because this
+# package was not available. Install it to satisfy the plan as written.
+# gguf==0.12.0
