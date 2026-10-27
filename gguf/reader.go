@@ -526,6 +526,17 @@ func (f *File) Path() string { return f.path }
 // Alignment returns the tensor-data alignment in bytes.
 func (f *File) Alignment() uint64 { return f.alignment }
 
+// DataStart returns the absolute file offset where the tensor-data section
+// begins, i.e. the first byte after the aligned end of the metadata and
+// tensor-info tables. Exposed so callers can verify layout accounting.
+func (f *File) DataStart() int64 { return f.dataStart }
+
+// Has reports whether the metadata key is present.
+func (f *File) Has(key string) bool {
+	_, ok := f.meta[key]
+	return ok
+}
+
 // TensorCount returns the number of tensors.
 func (f *File) TensorCount() int { return len(f.order) }
 

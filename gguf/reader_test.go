@@ -2,7 +2,9 @@ package gguf
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -573,4 +575,173 @@ func TestAdjacentTensorsAccepted(t *testing.T) {
 		t.Fatalf("adjacent tensors rejected: %v", err)
 	}
 	f.Close()
+}
+
+// TestMetadataValueWidthsRoundTrip exercises every metadata value type and
+// checks that the parser tracks how many bytes it consumed. got and want are
+// the parser's byte position after reading the value versus the position
+// computed independently from the encoding, so a wrong width shows up as a
+// mismatch instead of silently shifting dataStart later.
+func TestMetadataValueWidthsRoundTrip(t *testing.T) {
+	type tc struct {
+		name string
+		tag  ValueType
+		emit func(w *Writer)
+		size uint64 // bytes the value must occupy, computed by hand
+	}
+	cases := []tc{
+		{"uint8", ValUint8, func(w *Writer) { w.write(uint8(200)) }, 1},
+		{"int8", ValInt8, func(w *Writer) { w.write(int8(-5)) }, 1},
+		{"uint16", ValUint16, func(w *Writer) { w.write(uint16(65535)) }, 2},
+		{"int16", ValInt16, func(w *Writer) { w.write(int16(-300)) }, 2},
+		{"uint32", ValUint32, func(w *Writer) { w.WriteUint32(4294967295) }, 4},
+		{"int32", ValInt32, func(w *Writer) { w.write(int32(-70000)) }, 4},
+		{"float32", ValFloat32, func(w *Writer) { w.WriteFloat32(1.5) }, 4},
+		{"bool", ValBool, func(w *Writer) { w.write(uint8(1)) }, 1},
+		{"string", ValString, func(w *Writer) { w.WriteString("hello") }, 8 + 5},
+		{"uint64", ValUint64, func(w *Writer) { w.WriteUint64(1 << 40) }, 8},
+		{"int64", ValInt64, func(w *Writer) { w.write(int64(-(1 << 40))) }, 8},
+		{"float64", ValFloat64, func(w *Writer) {
+			var b [8]byte
+			binary.LittleEndian.PutUint64(b[:], math.Float64bits(2.5))
+			w.WriteRaw(b[:])
+		}, 8},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := NewWriter(&buf)
+			w.WriteMagic()
+			w.WriteVersion(3)
+			w.WriteUint64(0) // no tensors
+			w.WriteUint64(1) // one kv
+			w.WriteString("k")
+			w.WriteUint32(uint32(c.tag))
+			valueStart := uint64(w.Offset())
+			c.emit(w)
+			afterValue := uint64(w.Offset())
+			if got := afterValue - valueStart; got != c.size {
+				t.Fatalf("%s: encoded width %d, hand-computed %d", c.name, got, c.size)
+			}
+			// Pad so the data section is non-empty and parse reaches the end.
+			w.WritePadding(32)
+			w.WriteRaw(make([]byte, 32))
+			if err := w.Err(); err != nil {
+				t.Fatal(err)
+			}
+			f, err := openRaw(t, buf.Bytes())
+			if err != nil {
+				t.Fatalf("%s: parse failed: %v", c.name, err)
+			}
+			defer f.Close()
+			// dataStart must equal the aligned position of the value end.
+			want := valueStart + c.size
+			if want%32 != 0 {
+				want += 32 - want%32
+			}
+			if got := uint64(f.DataStart()); got != want {
+				t.Fatalf("%s: dataStart %d, computed independently as %d (value consumed wrongly)",
+					c.name, got, want)
+			}
+			if !f.Has("k") {
+				t.Fatalf("%s: metadata key missing after parse", c.name)
+			}
+		})
+	}
+}
+
+// TestMetadataArrayElementWidths checks array element widths too, including a
+// nested array (which must be rejected as an element type) and an oversized
+// declared length.
+func TestMetadataArrayElementWidths(t *testing.T) {
+	t.Run("uint16 array", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf)
+		w.WriteMagic()
+		w.WriteVersion(3)
+		w.WriteUint64(0)
+		w.WriteUint64(1)
+		w.WriteString("k")
+		w.WriteUint32(uint32(ValArray))
+		w.WriteUint32(uint32(ValUint16))
+		w.WriteUint64(3)
+		for _, v := range []uint16{1, 2, 3} {
+			w.write(v)
+		}
+		valueStart := uint64(w.Offset())
+		w.WritePadding(32)
+		w.WriteRaw(make([]byte, 32))
+		f, err := openRaw(t, buf.Bytes())
+		if err != nil {
+			t.Fatalf("parse failed: %v", err)
+		}
+		defer f.Close()
+		// 4 (elem tag) + 8 (len) + 3*2 (elements)
+		want := valueStart - 12
+		if want%32 != 0 {
+			want += 32 - want%32
+		}
+		if got := uint64(f.DataStart()); got != want {
+			t.Fatalf("dataStart %d, computed independently as %d", got, want)
+		}
+	})
+
+	t.Run("oversized array length", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf)
+		w.WriteMagic()
+		w.WriteVersion(3)
+		w.WriteUint64(0)
+		w.WriteUint64(1)
+		w.WriteString("k")
+		w.WriteUint32(uint32(ValArray))
+		w.WriteUint32(uint32(ValUint8))
+		w.WriteUint64(1 << 29) // above the 1<<28 limit
+		w.WriteRaw(make([]byte, 64))
+		f, err := openRaw(t, buf.Bytes())
+		if err == nil {
+			f.Close()
+			t.Fatal("oversized array length accepted")
+		}
+		t.Logf("rejected: %v", err)
+	})
+
+	t.Run("nested array element rejected", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf)
+		w.WriteMagic()
+		w.WriteVersion(3)
+		w.WriteUint64(0)
+		w.WriteUint64(1)
+		w.WriteString("k")
+		w.WriteUint32(uint32(ValArray))
+		w.WriteUint32(uint32(ValArray)) // array of arrays
+		w.WriteUint64(1)
+		w.WriteRaw(make([]byte, 64))
+		f, err := openRaw(t, buf.Bytes())
+		if err == nil {
+			f.Close()
+			t.Fatal("nested array accepted")
+		}
+		t.Logf("rejected: %v", err)
+	})
+
+	t.Run("invalid bool byte", func(t *testing.T) {
+		var buf bytes.Buffer
+		w := NewWriter(&buf)
+		w.WriteMagic()
+		w.WriteVersion(3)
+		w.WriteUint64(0)
+		w.WriteUint64(1)
+		w.WriteString("k")
+		w.WriteUint32(uint32(ValBool))
+		w.write(uint8(2)) // only 0 and 1 are legal
+		w.WriteRaw(make([]byte, 64))
+		f, err := openRaw(t, buf.Bytes())
+		if err == nil {
+			f.Close()
+			t.Fatal("invalid bool byte accepted")
+		}
+		t.Logf("rejected: %v", err)
+	})
 }
