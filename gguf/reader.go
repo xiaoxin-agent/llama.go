@@ -309,12 +309,17 @@ func (f *File) parse() error {
 		}
 		n, err := ti.NBytes()
 		if err != nil {
-			if errors.Is(err, ErrUnknownType) {
+			if errors.Is(err, ErrUnimplementedType) {
 				// Keep the tensor in the table and let the caller decide.
 				// Refusing to open the file would make correctly parsed
 				// metadata unreachable just because one element type is
 				// unimplemented - which is the situation of every real
-				// quantised model, where embeddings stay at Q6_K.
+				// quantised model, where the output projection is often
+				// Q6_K while the rest of the file is Q4_0.
+				//
+				// ErrInvalidType is NOT tolerated here: a tag ggml never
+				// assigned means the file is corrupt, not merely ahead of
+				// this package, and silently continuing would hide that.
 				//
 				// The payload cannot be bounds-checked, but tensor payloads are
 				// read on demand (ReadRaw) and that path errors on unknown
