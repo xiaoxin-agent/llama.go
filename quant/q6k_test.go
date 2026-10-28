@@ -151,3 +151,40 @@ func f32ToF16(f float32) uint16 {
 	}
 	return sign | uint16(exp+15)<<10 | uint16(mant>>13)
 }
+
+// TestDequantQ6_KLengthGuards covers the two rejection paths. They matter more
+// than usual here: a *shorter* payload silently dequantises as a truncated
+// tensor if the length is never checked, and every downstream matmul then
+// reads zeros it believes came from the model.
+func TestDequantQ6_KLengthGuards(t *testing.T) {
+	raw := make([]byte, 2*SizeOfQ6_K)
+	binary.LittleEndian.PutUint16(raw[208:], f32ToF16(1.0))
+	binary.LittleEndian.PutUint16(raw[SizeOfQ6_K+208:], f32ToF16(1.0))
+
+	cases := []struct {
+		name string
+		raw  []byte
+		n    int
+	}{
+		{name: "element count not a multiple of QK_K", raw: raw, n: QK_K + 1},
+		{name: "payload one byte short", raw: raw[:len(raw)-1], n: 2 * QK_K},
+		{name: "payload one byte long", raw: append(raw, 0), n: 2 * QK_K},
+		{name: "payload empty", raw: nil, n: QK_K},
+		{name: "block count disagrees with payload", raw: raw, n: QK_K},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := Dequantize(Q6_K, c.raw, c.n); err == nil {
+				t.Fatalf("Dequantize(q6_k, %d bytes, n=%d) = nil error, want rejection",
+					len(c.raw), c.n)
+			}
+		})
+	}
+
+	// DequantizeInto shares the same guards; a caller that preallocated the
+	// destination must not get a partially filled buffer back as success.
+	dst := make([]float32, QK_K+1)
+	if err := DequantizeInto(Q6_K, raw, dst); err == nil {
+		t.Fatal("DequantizeInto(q6_k, n not a multiple of QK_K) = nil error, want rejection")
+	}
+}

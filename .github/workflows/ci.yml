@@ -16,6 +16,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The layout invariant is only meaningful against a real file, so CI
+      # needs one. The small Q8_0 model is pinned by sha256 in docs/models.md;
+      # the checksum is verified here because a truncated or substituted
+      # download would otherwise pass or fail for the wrong reason.
+      - name: fetch reference model
+        env:
+          MODEL_URL: https://huggingface.co/QuantFactory/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct.Q8_0.gguf
+          MODEL_SHA256: 40f7094960b6ede829145d102ca79451b364b27d9d8694d4406e002024cff357
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/model.gguf" "$MODEL_URL"
+          echo "$MODEL_SHA256  $RUNNER_TEMP/model.gguf" | sha256sum -c -
+
       - name: format
         run: |
           out=$(gofmt -l .)
@@ -29,9 +42,13 @@ jobs:
         run: go vet ./...
 
       - name: test
+        env:
+          LLAMA_GO_TEST_GGUF: ${{ runner.temp }}/model.gguf
         run: go test ./... -count=1 -race
 
       - name: cover
+        env:
+          LLAMA_GO_TEST_GGUF: ${{ runner.temp }}/model.gguf
         run: go test ./... -count=1 -cover
 
       - name: build
