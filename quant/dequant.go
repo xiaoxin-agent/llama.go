@@ -15,6 +15,12 @@ const (
 	SizeOfQ4_0 = 2 + QK4_0/2 // 18
 	// SizeOfQ8_0 is sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0.
 	SizeOfQ8_0 = 2 + QK8_0 // 34
+
+	// QK_K is the super-block size of the K-quant family.
+	QK_K = 256
+
+	// SizeOfQ6_K is sizeof(block_q6_K) == ql(128) + qh(64) + scales(16) + d(2).
+	SizeOfQ6_K = 210
 )
 
 // Kind mirrors the subset of ggml_type this package can dequantise.
@@ -25,6 +31,7 @@ const (
 	F16  Kind = 1
 	Q4_0 Kind = 2
 	Q8_0 Kind = 8
+	Q6_K Kind = 14
 )
 
 // String returns the ggml type name.
@@ -38,6 +45,8 @@ func (k Kind) String() string {
 		return "q4_0"
 	case Q8_0:
 		return "q8_0"
+	case Q6_K:
+		return "q6_k"
 	}
 	return fmt.Sprintf("kind(%d)", uint32(k))
 }
@@ -114,6 +123,8 @@ func DequantizeInto(kind Kind, raw []byte, dst []float32) error {
 		return dequantQ4_0(raw, dst)
 	case Q8_0:
 		return dequantQ8_0(raw, dst)
+	case Q6_K:
+		return dequantQ6_K(raw, dst)
 	}
 	return fmt.Errorf("quant: unsupported kind %s", kind)
 }
@@ -165,6 +176,74 @@ func dequantQ8_0(raw []byte, dst []float32) error {
 		base := b * QK8_0
 		for j := 0; j < QK8_0; j++ {
 			dst[base+j] = float32(int8(blk[2+j])) * d
+		}
+	}
+	return nil
+}
+
+// dequantQ6_K mirrors dequantize_row_q6_K in ggml/src/ggml-quants.c.
+//
+// Block layout (210 bytes, 256 weights):
+//
+//	ql[128]     lower 4 bits of every weight
+//	qh[64]      upper 2 bits
+//	scales[16]  int8, one per group of 16 weights
+//	d           fp16 super-block scale
+//
+// The 256 weights are decoded in two halves of 128. Within a half, index
+// l in [0,32) writes to l, l+32, l+64 and l+96, and is = l/16 selects one of
+// two columns of the scale window, so the eight scales of a half map to
+// output slots as l+0 -> sc[is+0], l+32 -> sc[is+2], l+64 -> sc[is+4],
+// l+96 -> sc[is+6]. Mapping the two halves or the four columns incorrectly
+// still yields plausible-looking weights, only permuted.
+func dequantQ6_K(raw []byte, dst []float32) error {
+	n := len(dst)
+	if n%QK_K != 0 {
+		return fmt.Errorf("quant: q6_k element count %d is not a multiple of %d", n, QK_K)
+	}
+	nb := n / QK_K
+	if len(raw) != nb*SizeOfQ6_K {
+		return fmt.Errorf("quant: q6_k payload %d bytes, want %d", len(raw), nb*SizeOfQ6_K)
+	}
+
+	for b := 0; b < nb; b++ {
+		blk := raw[b*SizeOfQ6_K:]
+		ql := blk[0:128]
+		qh := blk[128:192]
+		scales := blk[192:208]
+		d := Float16ToFloat32(binary.LittleEndian.Uint16(blk[208:210]))
+
+		base := b * QK_K
+		for half := 0; half < 2; half++ {
+			qlh := ql[half*64 : half*64+64]
+			qhh := qh[half*32 : half*32+32]
+			off := half * 128
+
+			for l := 0; l < 32; l++ {
+				is := l / 16
+				q1 := int(qlh[l]&0x0F | ((qhh[l]>>0)&3)<<4)
+				q2 := int(qlh[l+32]&0x0F | ((qhh[l]>>2)&3)<<4)
+				q3 := int(qlh[l]>>4 | ((qhh[l]>>4)&3)<<4)
+				q4 := int(qlh[l+32]>>4 | ((qhh[l]>>6)&3)<<4)
+
+				// Each group of 16 weights has its own int8 scale, so the four
+				// output slots of this l read four different scales.
+				//
+				// scales is []byte, so it must go through int8: a negative
+				// scale read as uint8 becomes 256+|s|, which inflates the
+				// weight by up to 256x and still produces finite values that
+				// look like plausible weights until compared against a
+				// reference. int8(...) is the conversion, not int(...).
+				sc := scales[half*8:]
+				s0 := float32(int8(sc[is+0]))
+				s2 := float32(int8(sc[is+2]))
+				s4 := float32(int8(sc[is+4]))
+				s6 := float32(int8(sc[is+6]))
+				dst[base+off+l+0] = d * s0 * float32(q1-32)
+				dst[base+off+l+32] = d * s2 * float32(q2-32)
+				dst[base+off+l+64] = d * s4 * float32(q3-32)
+				dst[base+off+l+96] = d * s6 * float32(q4-32)
+			}
 		}
 	}
 	return nil

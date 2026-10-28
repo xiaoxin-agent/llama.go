@@ -35,6 +35,12 @@ func TypeSize(t Type, n uint64) (uint64, error) {
 			return 0, fmt.Errorf("q4_0: element count %d is not a multiple of 32", n)
 		}
 		return (n / 32) * 18, nil
+	case TypeQ6_K:
+		// block_q6_K: ql[128] qh[64] scales[16] d(2) = 210 bytes per 256 weights.
+		if n%256 != 0 {
+			return 0, fmt.Errorf("q6_k: element count %d is not a multiple of 256", n)
+		}
+		return (n / 256) * 210, nil
 	}
 	return 0, fmt.Errorf("%w: %s", ErrUnknownType, t)
 }
