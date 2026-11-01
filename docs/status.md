@@ -1,0 +1,137 @@
+# llama.go 执行进度
+
+> 计划正文见 [`plan-v0.1.md`](plan-v0.1.md)。本文档只记录执行状态，不修改计划本身。
+>
+> 最后更新：2026-11-01 03:10 UTC
+
+## 记号
+
+- ✅ 达成　🔶 部分完成　⬜ 未开始
+- 两套门禁不可混淆：
+  - **里程碑证据**（第 7 节体系）回答"交付了什么"
+  - **G1–G8 数值门禁**（§6.3 体系）回答"数值上做到什么程度才算对"
+  - M1 的"四条门禁"属于前者，**不是** G1–G8 中的任何一条
+
+## 里程碑
+
+| 里程碑 | 计划内容 | 状态 | 说明 |
+|---|---|---|---|
+| M0 环境与参照基线 | Go、脚手架、模型、参考导出 | 🔶 大部分完成（5/6） | Go 1.23.4 已装并验证；`go.mod`/`Makefile`/CI 骨架齐全；模型 sha256 已记录（`docs/models.md`）；`requirements-ref.txt` 与 `tools/ref_export.py` 已写。Python 参考环境已恢复，SmolLM2 2 层与 TinyLlama 22 层参考导出均已跑通，tokenizer 边界 gate 已通过；**缺** §1 待证项关闭 |
+| M1 GGUF 解析器 | `gguf/` + `cmd/gguf-inspect` | ✅ 门禁已过（2026-10-27 22:00 UTC） | 四条证据全部达成，见下节；`cmd/gguf-inspect` 已建（`886f9cf`） |
+| M2 反量化与张量算子 | `quant/` + `tensor/` | 🔶 只完成 `quant/` | `quant/` 已支持 F32/F16/Q4_0/Q8_0/Q6_K；`tensor/` 尚未创建；其他 K-quant 尚未支持 |
+| M3 及以后 | — | ⬜ 未开始 | — |
+
+## M1 门禁证据（已关闭）
+
+| 证据 | 要求 | 结果 |
+|---|---|---|
+| 1 单元测试 | 全绿，含各类畸形输入不 panic | ✅ 覆盖率 73.0%（原 52.7%）；`go vet` 干净 |
+| 2 metadata 逐行等价 | 与参考逐字段比对，差异表为空 | ✅ 23 个 key 全部命中、**差异 0**、顺序与文件一致 |
+| 3 张量字节一致 | `ReadRaw` 与独立 Python 切片完全一致 | ✅ 用真实 `token_embd.weight` 比对，逐位相同 |
+| 4 内存峰值 | `inspect` 全程 RSS < 100 MB | ✅ **9.7 MB**（`-meta-only`）/ **9.4 MB**（完整模式），文件 637 MB，余量约 10 倍 |
+
+### 证据 2 的参考实现说明
+
+计划原文要求"与参考 `gguf_dump` 逐行等价"。实际使用的是**自写的独立 Python 解析器**（`struct` 手写，未复用 Go 代码），**不是** llama.cpp 官方 `gguf_dump` —— 本机没有可运行 Python `gguf` 包的环境。
+
+这是一个**替代参考**。若要严格按计划原文执行，需先安装 `gguf` 包并用官方 `gguf_dump` 复核一遍。独立性与逐位比对的有效性不受影响，但与计划措辞有偏差，如实记录。
+
+### 证据 2 通过所依赖的修复
+
+均非"为通过而调参"：
+
+1. `MetadataKeys()` 改为返回**文件顺序**。原先排序后返回，而文件顺序是格式的一部分、参考实现也按写入顺序输出，逐行 diff 无从谈起。排序能力保留在 `SortedMetadataKeys()`。
+2. `Value.String()` 浮点恒带小数点。`%v` 把 `10000.0` 打成 `10000`，值虽正确但逐行比对必然误报。
+3. 重复 metadata key 由**静默覆盖**改为拒绝，与重复张量名的处理对齐。
+
+### 取证过程中的两次自伤
+
+记录在此以免重犯：
+
+1. 比较脚本**按行切分**输出，而 `tokenizer.chat_template` 的值内含换行 —— 首行之后全部被丢弃，误判为"字符串在解析阶段被截断"。改成按 key 边界解析后差异立即归零。当时差点去查一个不存在的解析器 bug。
+2. 第一次修浮点格式改在 `Value.any()` 上，返回类型从 `float64` 换成 `string` —— `%v` 对 string 仍原样输出，等于没修。格式化属于 `String()`，不属于 `any()`。
+
+## M0 交付物逐项状态
+
+计划 §7 M0 列出六项交付物。按计划定义，六项全部达成才算完成。
+
+| 交付物 | 状态 | 证据 |
+|---|---|---|
+| `go.mod`、`Makefile`、CI 脚本骨架 | ✅ | `Makefile` 含 `verify` 目标；`.github/workflows/ci.yml` 跑 fmt/vet/test/cover/build |
+| Go ≥1.22 | ✅ 变通 | go1.23.4 linux/amd64 已装并可编译；本次恢复置于 workspace `.tools/go` |
+| Python 参考环境 | ✅ 变通 | workspace 私有 `PYTHONPATH` 环境可导入 `torch 2.5.1+cpu` / `transformers 4.46.3` / `numpy 1.26.4`，`torch.cuda.is_available()` 为 false |
+| `requirements-ref.txt` | ✅ | 钉版 torch 2.5.1 / transformers 4.46.3 / numpy 1.26.4，全 CPU |
+| 两个 GGUF + sha256 | ✅ 当前环境已恢复 | TinyLlama Q4_0 与 SmolLM2-135M Q8_0 均已重新下载并核验 sha256，校验值见 [`models.md`](models.md) |
+| `tools/ref_export.py` | ✅ 已写并实跑 | 脚本存在，支持 GGUF metadata/tensor 导出、Q4_0/Q6_K 反量化参考路径、HF 权重流式加载和 forward 输出；已用 SmolLM2 2 层、TinyLlama 2 层、TinyLlama 22 层产出 logits/hidden/tokens/manifest。TinyLlama 需显式 `--hf-tokenizer TinyLlama/TinyLlama-1.1B-Chat-v1.0` 或 `--token-ids`，避免把 LLaMA tokenizer 误当 byte-BPE |
+
+### M0 证据
+
+| 证据 | 状态 |
+|---|---|
+| 1 `go version` / `torch.__version__` 实际输出 | Go ✅（`go1.23.4 linux/amd64`）；torch ✅（`2.5.1+cpu`）；transformers ✅（`4.46.3`）；numpy ✅（`1.26.4`） |
+| 2 两个 GGUF 的 `sha256sum` | ✅ TinyLlama Q4_0：`da3087fb14aede55fde6eb81a0e55e886810e43509ec82ecdc7aa5d62a03b556`；SmolLM2 Q8_0：`40f7094960b6ede829145d102ca79451b364b27d9d8694d4406e002024cff357` |
+| 3 `ref_export.py --prompt "Hello"` 产出 4 类文件 | ✅ TinyLlama 22 层完整导出通过，HF tokenizer token id 为 `[15043]`：`logits.npy`、`hidden_0.npy` ... `hidden_21.npy`、`tokens.json`、`manifest.json` |
+| 4 关闭 §1 待证项 | ❌ 未做 |
+
+### 阻塞 M0 关闭的剩余事项
+
+Python 参考环境（R1）已恢复，并已跑通 TinyLlama Q4_0 的 22 层完整参考前向。它同时是
+G2–G5、G7 的**唯一**参照来源；M0 关闭前剩余风险主要是计划 §1 待证项，而不是 forward
+导出链路或 tokenizer 参考侧覆盖。
+
+本次恢复时实测机器资源：根分区剩余约 15 GB，宿主内存 62 GiB，但 gateway 容器曾在
+8 Gi limit 下 OOMKilled。16 Gi limit 下 TinyLlama 22 层参考导出完成，cgroup
+`memory.current` 采样峰值约 `8,236,859,392` bytes。低于 12-16 Gi 的 gateway limit 下
+仍不建议跑完整导出；可先用 `--model-layers 2` 做映射验证。
+
+### Tokenizer 注意事项
+
+`tokenizer.ggml.model=gpt2` 的 GGUF metadata 可由当前 `tokenize_bytes_bpe` 路径处理，且已通过
+`tools/tokenizer_gate.py` 与 HF tokenizer 逐 id 对齐。覆盖用例包括 ASCII、前导空格、
+重复空格、换行 tab、中英混排、emoji、ZWJ emoji、空串。TinyLlama 的
+`tokenizer.ggml.model=llama` 不能走该路径；
+曾经的简化实现会把 `Hello` 错拆为 `[75, 104, 111, 111, 114]`，而 HF tokenizer 正确结果
+是 `[15043]`。当前脚本已改为：非 `gpt2` metadata 内建 tokenizer 会报错，调用方必须传
+`--hf-tokenizer` 或显式 `--token-ids`。
+
+## G1–G8 数值门禁
+
+| 门禁 | 判据 | 参照 | 状态 | 阻塞原因 |
+|---|---|---|---|---|
+| G1 反量化正确 | 覆盖率 100% 的 (type × 边界长度) | **R0** | 🔶 F16 / Q4_0 / Q8_0 / Q6_K 已覆盖 | F16 已覆盖全部 65536 个 half bit pattern；Q4_0/Q8_0 有独立参考比对；Q6_K 有边界、符号与写槽保护测试。仍需用真实模型与独立导出补齐完整门禁证据 |
+| G2 单算子正确 | matmul/rmsnorm/rope/softmax/silu 各自独立测试 | **R0 + R1** | ⬜ 未开始 | `tensor/` 包尚不存在；R1 未建 |
+| G3 单层前向正确 | 固定输入下 attn 子块与 ffn 子块分别对齐 | **R1** | ⬜ 未开始 | 依赖 G2；R1 未建 |
+| G4 全模型 prefill | logits max abs diff ≤ 1e-3 | **R1** | ⬜ 未开始 | 依赖 G3；R1 未建 |
+| G5 增量 decode | 逐 token 与 prefill 版结果一致（自洽） | **R1** | ⬜ 未开始 | 依赖 G4；R1 未建 |
+| G6 端到端生成 | 贪心 32 token id 完全一致 | **R2** | ⬜ 未开始 | R2（llama.cpp 二进制对照）未建 |
+| G7 tokenizer | 逐 id 对齐，覆盖中英混排/emoji/空白边界 | **R1**（HF tokenizer） | 🔶 参考侧已覆盖 | `tools/tokenizer_gate.py` 已覆盖 ASCII、空白、中英混排、emoji、ZWJ emoji、空串。SmolLM2 GGUF gpt2-BPE 路径逐 id 对齐 HF；TinyLlama 走 HF tokenizer，且内建误用路径会失败。Go 侧 tokenizer 尚未实现，不能关闭端到端 G7 |
+| G8 性能基线 | 记录 tokens/s，不做优化承诺 | 自身实测 | ⬜ 未开始 | 无推理路径可跑，无从测速 |
+
+### 共同阻塞点：G2 尚未开始
+
+G2–G5、G7 五项**全部只有 R1 这一个参照来源**。R1 即 `tools/ref_export.py`（transformers + torch CPU 导出 logits 与中间 hidden），脚本已经存在，Python 参考环境也已在 workspace 私有目录恢复。当前 forward 证据已覆盖 TinyLlama 22 层；tokenizer 参考侧边界用例也已覆盖。
+
+直接后果：即使现在开始写 `tensor/`，G2 也无法判定通过与否 —— 没有参照答案。
+
+历史说明：2026-10-28 时，远端提交 `194c633` 记录的阻塞点是 Python 环境虽可用但
+`tools/ref_export.py` 还不产 logits；本轮状态更新已经被后续恢复工作取代，当前剩余阻塞不再是
+参考导出链路本身。
+
+实际可执行的最低启动顺序：
+
+```
+tensor/  →  G2
+```
+
+## 未关闭的评审发现
+
+`docs/reviews/` 下四份报告，索引见 `docs/reviews/README.md`，其中记录了 7 个未关闭的非阻断项。裁决与处理状态以该索引为准。
+
+## 流程偏离记录
+
+计划规定 M1 由 Writer 主责、Reviewer 复核、Coordinator 不碰代码。实际情况：
+
+- 三次评审**全部由 Coordinator 执行**（第一次因 Reviewer 磁盘满崩溃而接管，后两次为补验）
+- 作者自评的局限已在 `docs/reviews/m0-round1-author-selfreview.md` 中如实标注，并保留而非删除
+
+口径修正：此前把「仓库脚手架」与「GGUF 解析器」打包成一次提交（`daa7dfe`），并在汇报中把解析器代码称为 M0 交付物。按计划，`gguf/` 属于 **M1**，M0 只负责环境与基线。
