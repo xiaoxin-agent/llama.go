@@ -2,3 +2,4 @@
 # built binaries
 /gguf-inspect
 __pycache__/
+/.ref-smoke-*

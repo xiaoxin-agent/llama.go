@@ -2,7 +2,7 @@
 
 A CPU-only LLM inference engine in pure Go, inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
-**Status: M0 complete.** GGUF parsing and quantisation dequantisation are implemented and tested. No forward pass yet — see [docs/plan-v0.1.md](docs/plan-v0.1.md) for the full milestone plan.
+**Status: GGUF parsing and quantisation dequantisation are implemented and tested.** No forward pass yet — see [docs/plan-v0.1.md](docs/plan-v0.1.md) for the full milestone plan and [docs/status.md](docs/status.md) for current execution status.
 
 ## Design constraints
 
@@ -15,7 +15,7 @@ A CPU-only LLM inference engine in pure Go, inspired by [llama.cpp](https://gith
 | Package | Capability | Test coverage |
 |---|---|---|
 | `gguf` | GGUF v3 parsing: header, all 13 metadata value types, string/array metadata, tensor table, alignment, mmap-backed payload access | 52.7% |
-| `quant` | Dequantisation: F32, F16 (all 65536 half patterns verified), Q8_0, Q4_0 | 93.9% |
+| `quant` | Dequantisation: F32, F16 (all 65536 half patterns verified), Q8_0, Q4_0, Q6_K | 93.9% |
 
 ### Verified against a real model
 

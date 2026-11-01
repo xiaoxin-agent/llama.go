@@ -266,6 +266,11 @@ func RowStride(kind Kind, cols int) (int, error) {
 			return 0, fmt.Errorf("quant: q8_0 row of %d elements is not block-aligned", cols)
 		}
 		return (cols / QK8_0) * SizeOfQ8_0, nil
+	case Q6_K:
+		if cols%QK_K != 0 {
+			return 0, fmt.Errorf("quant: q6_k row of %d elements is not block-aligned", cols)
+		}
+		return (cols / QK_K) * SizeOfQ6_K, nil
 	}
 	return 0, fmt.Errorf("quant: unsupported kind %s", kind)
 }

@@ -10,6 +10,7 @@
 torch==2.5.1
 transformers==4.46.3
 numpy==1.26.4
+regex==2026.9.29
 
 # Used only to cross-check GGUF metadata against llama.cpp's own dumper.
 # Optional: gate evidence 2 currently uses a self-written parser because this

@@ -296,7 +296,10 @@ func TestRowStride(t *testing.T) {
 		{Q8_0, 32, 34, true},
 		{Q8_0, 2048, 2176, true},
 		{Q4_0, 2048, 1152, true},
+		{Q6_K, 256, 210, true},
+		{Q6_K, 2048, 1680, true},
 		{Q4_0, 33, 0, false},
+		{Q6_K, 255, 0, false},
 		{Kind(99), 32, 0, false},
 	}
 	for _, c := range cases {

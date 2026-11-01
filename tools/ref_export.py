@@ -283,7 +283,7 @@ def dequant_q6_k(raw, n):
 
 DEQUANT = {
     T_F32: lambda raw, n: np.frombuffer(raw, dtype="<f4").astype(np.float32),
-    T_F16: lambda raw, n: f16_to_f32(np.frombuffer(raw, dtype="<f2")),
+    T_F16: lambda raw, n: f16_to_f32(np.frombuffer(raw, dtype="<u2")),
     T_Q4_0: dequant_q4_0,
     T_Q8_0: dequant_q8_0,
     T_Q6_K: dequant_q6_k,
@@ -330,6 +330,227 @@ def load_tensor(tensors, data, data_start, name):
     return fn(data[start:start + need], n), t["dims"], TYPE_NAMES.get(ttype, str(ttype))
 
 
+def tensor_map(tensors):
+    out = {}
+    for t in tensors:
+        if t["name"] in out:
+            raise ValueError("duplicate tensor name %r" % t["name"])
+        out[t["name"]] = t
+    return out
+
+
+def reshape_gguf(values, dims, hf_shape, name):
+    """Reshape GGUF flat values to the matching transformers parameter shape.
+
+    GGUF stores dimensions as ne[0], ne[1], ... where ne[0] is the innermost,
+    contiguous dimension. A 2-D linear weight with dims [in, out] is therefore
+    already laid out row-major as [out, in], exactly like torch nn.Linear.
+    There is no transpose here.
+    """
+    if len(dims) == 1:
+        got = (int(dims[0]),)
+    elif len(dims) == 2:
+        got = (int(dims[1]), int(dims[0]))
+    else:
+        raise ValueError("%s: unsupported GGUF rank %d" % (name, len(dims)))
+
+    want = tuple(int(x) for x in hf_shape)
+    if got != want:
+        raise ValueError("%s: GGUF dims %s reshape to %s, HF wants %s"
+                         % (name, dims, got, want))
+    return values.reshape(got)
+
+
+def hf_name_map(n_layer, has_output):
+    yield "token_embd.weight", "model.embed_tokens.weight"
+    for i in range(n_layer):
+        p = "blk.%d." % i
+        q = "model.layers.%d." % i
+        yield p + "attn_norm.weight", q + "input_layernorm.weight"
+        yield p + "attn_q.weight", q + "self_attn.q_proj.weight"
+        yield p + "attn_k.weight", q + "self_attn.k_proj.weight"
+        yield p + "attn_v.weight", q + "self_attn.v_proj.weight"
+        yield p + "attn_output.weight", q + "self_attn.o_proj.weight"
+        yield p + "ffn_norm.weight", q + "post_attention_layernorm.weight"
+        yield p + "ffn_gate.weight", q + "mlp.gate_proj.weight"
+        yield p + "ffn_up.weight", q + "mlp.up_proj.weight"
+        yield p + "ffn_down.weight", q + "mlp.down_proj.weight"
+    yield "output_norm.weight", "model.norm.weight"
+    if has_output:
+        yield "output.weight", "lm_head.weight"
+
+
+def parse_layer_selection(spec, n_layer):
+    if spec == "none":
+        return []
+    if spec == "all":
+        return list(range(n_layer))
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        i = int(part)
+        if i < 0 or i >= n_layer:
+            raise ValueError("layer index %d outside [0,%d)" % (i, n_layer))
+        out.append(i)
+    return out
+
+
+def parse_token_ids(text):
+    if text is None:
+        return None
+    out = []
+    for part in text.replace(",", " ").split():
+        out.append(int(part))
+    if not out:
+        raise ValueError("--token-ids was provided but no ids were parsed")
+    return out
+
+
+def gpt2_byte_encoder():
+    bs = list(range(ord("!"), ord("~") + 1))
+    bs += list(range(ord("¡"), ord("¬") + 1))
+    bs += list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+def tokenize_bytes_bpe(meta, text):
+    """Small byte-BPE tokenizer for GGUF tokenizer metadata.
+
+    This is intentionally independent of transformers. It relies on the regex
+    package for GPT-2 compatible pre-tokenisation, then uses
+    tokenizer.ggml.tokens plus tokenizer.ggml.merges. If the model metadata
+    omits add_bos_token, no BOS is invented.
+    """
+    vocab = {tok: i for i, tok in enumerate(meta.get("tokenizer.ggml.tokens", []))}
+    merges = meta.get("tokenizer.ggml.merges", [])
+    ranks = {}
+    for rank, merge in enumerate(merges):
+        if not isinstance(merge, str) or " " not in merge:
+            continue
+        left, right = merge.split(" ", 1)
+        ranks[(left, right)] = rank
+
+    unk_id = int(meta.get("tokenizer.ggml.unknown_token_id", 0))
+    add_bos = bool(meta.get("tokenizer.ggml.add_bos_token", False))
+    bos_id = int(meta.get("tokenizer.ggml.bos_token_id", 1))
+
+    import regex
+
+    pat = regex.compile(
+        r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+    encoder = gpt2_byte_encoder()
+    ids = []
+    for token in regex.findall(pat, text):
+        pieces = [encoder[b] for b in token.encode("utf-8")]
+        while len(pieces) > 1:
+            best = None
+            best_rank = None
+            for i in range(len(pieces) - 1):
+                rank = ranks.get((pieces[i], pieces[i + 1]))
+                if rank is not None and (best_rank is None or rank < best_rank):
+                    best = i
+                    best_rank = rank
+            if best is None:
+                break
+            merged = pieces[best] + pieces[best + 1]
+            pieces = pieces[:best] + [merged] + pieces[best + 2:]
+        ids.extend(vocab.get(piece, unk_id) for piece in pieces)
+    if add_bos:
+        ids.insert(0, bos_id)
+    return ids
+
+
+def tokenize_prompt(meta, prompt, hf_tokenizer=None):
+    if hf_tokenizer:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(hf_tokenizer, use_fast=True)
+        return tok.encode(prompt, add_special_tokens=False), "hf:%s" % hf_tokenizer
+
+    model = meta.get("tokenizer.ggml.model")
+    if model == "gpt2":
+        return tokenize_bytes_bpe(meta, prompt), "gguf:gpt2-bpe"
+
+    raise ValueError(
+        "tokenizer.ggml.model=%r is not supported by the built-in tokenizer; "
+        "pass --hf-tokenizer or --token-ids" % model)
+
+
+def build_config(meta, tensors_by_name, model_layers):
+    from transformers import LlamaConfig
+
+    arch = meta.get("general.architecture", "llama")
+    n_layer_file = int(meta.get("%s.block_count" % arch))
+    n_layer = n_layer_file if model_layers is None else int(model_layers)
+    if n_layer <= 0 or n_layer > n_layer_file:
+        raise ValueError("--model-layers must be in [1,%d], got %d"
+                         % (n_layer_file, n_layer))
+
+    embd_dims = tensors_by_name["token_embd.weight"]["dims"]
+    vocab = int(embd_dims[1])
+    has_output = "output.weight" in tensors_by_name
+
+    return LlamaConfig(
+        vocab_size=vocab,
+        hidden_size=int(meta.get("%s.embedding_length" % arch)),
+        intermediate_size=int(meta.get("%s.feed_forward_length" % arch)),
+        num_hidden_layers=n_layer,
+        num_attention_heads=int(meta.get("%s.attention.head_count" % arch)),
+        num_key_value_heads=int(meta.get("%s.attention.head_count_kv" % arch)),
+        max_position_embeddings=int(meta.get("%s.context_length" % arch)),
+        rms_norm_eps=float(meta.get("%s.attention.layer_norm_rms_epsilon" % arch)),
+        rope_theta=float(meta.get("%s.rope.freq_base" % arch)),
+        tie_word_embeddings=not has_output,
+        bos_token_id=int(meta.get("tokenizer.ggml.bos_token_id", 1)),
+        eos_token_id=int(meta.get("tokenizer.ggml.eos_token_id", 2)),
+        pad_token_id=int(meta.get("tokenizer.ggml.eos_token_id", 2)),
+        attention_bias=False,
+        mlp_bias=False,
+    )
+
+
+def stream_weights(model, tensors, data, data_start):
+    import torch
+
+    tensors_by_name = tensor_map(tensors)
+    params = dict(model.named_parameters())
+    written = set()
+    has_output = "output.weight" in tensors_by_name
+
+    for gguf_name, hf_name in hf_name_map(model.config.num_hidden_layers, has_output):
+        if hf_name not in params:
+            raise KeyError("HF model has no parameter %r for GGUF %r"
+                           % (hf_name, gguf_name))
+        values, dims, type_name = load_tensor(tensors, data, data_start, gguf_name)
+        param = params[hf_name]
+        arr = reshape_gguf(values, dims, tuple(param.shape), gguf_name)
+        if arr.dtype != np.float32:
+            arr = arr.astype(np.float32, copy=False)
+        with torch.no_grad():
+            param.copy_(torch.from_numpy(np.ascontiguousarray(arr)))
+        written.add(hf_name)
+        print("loaded %-34s -> %-48s %s %s"
+              % (gguf_name, hf_name, tuple(param.shape), type_name), flush=True)
+
+    missing = sorted(set(params) - written)
+    if missing:
+        raise ValueError("unmapped HF parameters: %s" % ", ".join(missing))
+    return written
+
+
+def write_numpy(path, arr):
+    np.save(path, np.asarray(arr, dtype=np.float32))
+    return sha256_file(path)
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -349,7 +570,13 @@ def main():
     ap.add_argument("--prompt", default="Hello", help="prompt text")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--layers", default="all",
-                    help="'all', 'none', or comma-separated layer indices")
+                    help="'all', 'none', or comma-separated layer indices to dump")
+    ap.add_argument("--model-layers", type=int,
+                    help="instantiate only the first N layers for smoke tests")
+    ap.add_argument("--token-ids",
+                    help="explicit token ids; overrides prompt tokenisation")
+    ap.add_argument("--hf-tokenizer",
+                    help="transformers tokenizer id/path for prompt tokenisation")
     ap.add_argument("--prompt-file", help="read the prompt from this file instead")
     args = ap.parse_args()
 
@@ -363,7 +590,9 @@ def main():
 
     meta, tensors, data_start, data = parse_gguf(args.model)
     print("parsed %s: %d tensors, %d metadata keys, data at %d"
-          % (os.path.basename(args.model), len(tensors), len(meta), data_start))
+          % (os.path.basename(args.model), len(tensors), len(meta), data_start),
+          flush=True)
+    tensors_by_name = tensor_map(tensors)
 
     arch = meta.get("general.architecture", "llama")
     n_layer = meta.get("%s.block_count" % arch)
@@ -374,21 +603,23 @@ def main():
     eps = meta.get("%s.attention.layer_norm_rms_epsilon" % arch)
     n_ctx = meta.get("%s.context_length" % arch)
 
-    print("arch=%s layers=%s embd=%s heads=%s/%s ffn=%s rms_eps=%s"
-          % (arch, n_layer, n_embd, n_head, n_head_kv, n_ff, eps))
+    rope_theta = meta.get("%s.rope.freq_base" % arch)
+    print("arch=%s layers=%s embd=%s heads=%s/%s ffn=%s rms_eps=%s rope_theta=%s"
+          % (arch, n_layer, n_embd, n_head, n_head_kv, n_ff, eps, rope_theta),
+          flush=True)
 
     # token_embd.weight has dims [n_embd, vocab] in GGML order: Dims[0] is the
     # innermost (fastest-varying) dimension, so the vocabulary is Dims[1].
     # Taking Dims[0] silently yields n_embd, which looks plausible (2048) and
     # would make every logits shape assertion fail for the wrong reason.
-    embd_dims = load_tensor(tensors, data, data_start, "token_embd.weight")[1]
+    embd_dims = tensors_by_name["token_embd.weight"]["dims"]
     if len(embd_dims) != 2:
         raise ValueError("token_embd.weight has %d dims, expected 2" % len(embd_dims))
     vtype_name = TYPE_NAMES.get(
         next(t["type"] for t in tensors if t["name"] == "token_embd.weight"), "?")
     vocab = embd_dims[1]
     print("token_embd: dims=%s type=%s -> vocab=%d"
-          % (embd_dims, vtype_name, vocab))
+          % (embd_dims, vtype_name, vocab), flush=True)
 
     # Cross-check against the tokenizer metadata, which is an independent
     # statement of the vocabulary size. A mismatch means the tensor table and
@@ -398,15 +629,69 @@ def main():
         raise ValueError(
             "vocab mismatch: token_embd dim1 = %d but tokenizer.ggml.tokens "
             "has %d entries" % (vocab, len(tokens)))
-    print("vocab cross-check against tokenizer.ggml.tokens: OK")
+    print("vocab cross-check against tokenizer.ggml.tokens: OK", flush=True)
 
-    # Parameters land here. The forward pass is the next step and this script
-    # deliberately stops short of it rather than emitting logits it cannot yet
-    # justify: a wrong reference is worse than no reference.
+    token_ids = parse_token_ids(args.token_ids)
+    tokenizer_source = "explicit"
+    if token_ids is None:
+        token_ids, tokenizer_source = tokenize_prompt(meta, prompt, args.hf_tokenizer)
+    if not token_ids:
+        raise ValueError("prompt tokenised to an empty sequence")
+    print("tokens (%s): %s" % (tokenizer_source, token_ids), flush=True)
+
+    print("importing torch/transformers...", flush=True)
+    import torch
+    from transformers import LlamaForCausalLM
+
+    cfg = build_config(meta, tensors_by_name, args.model_layers)
+    print("building LlamaForCausalLM with %d/%d layers..."
+          % (cfg.num_hidden_layers, n_layer), flush=True)
+    model = LlamaForCausalLM(cfg).eval()
+
+    print("streaming GGUF weights into HF parameters...", flush=True)
+    written = stream_weights(model, tensors, data, data_start)
+
+    dump_layers = parse_layer_selection(args.layers, cfg.num_hidden_layers)
+    hidden = {}
+    hooks = []
+    for i in dump_layers:
+        def save_hidden(_module, _inputs, output, layer=i):
+            hs = output[0] if isinstance(output, tuple) else output
+            hidden[layer] = hs.detach().to(torch.float32).cpu().numpy()[0]
+        hooks.append(model.model.layers[i].register_forward_hook(save_hidden))
+
+    input_ids = torch.tensor([token_ids], dtype=torch.long)
+    print("running forward seq=%d..." % len(token_ids), flush=True)
+    with torch.no_grad():
+        out = model(input_ids=input_ids, use_cache=False)
+
+    for h in hooks:
+        h.remove()
+
+    hashes = {}
+    logits_path = os.path.join(args.out, "logits.npy")
+    hashes["logits.npy"] = write_numpy(logits_path, out.logits[0].detach().cpu().numpy())
+    print("wrote %s" % logits_path, flush=True)
+
+    for i in dump_layers:
+        if i not in hidden:
+            raise RuntimeError("hook for layer %d did not fire" % i)
+        name = "hidden_%d.npy" % i
+        hashes[name] = write_numpy(os.path.join(args.out, name), hidden[i])
+        print("wrote %s" % os.path.join(args.out, name), flush=True)
+
+    tokens_path = os.path.join(args.out, "tokens.json")
+    with open(tokens_path, "w", encoding="utf-8") as fh:
+        json.dump({"prompt": prompt, "token_ids": token_ids}, fh,
+                  indent=2, ensure_ascii=False)
+    hashes["tokens.json"] = sha256_file(tokens_path)
+
     manifest = {
         "model_path": os.path.abspath(args.model),
         "model_sha256": sha256_file(args.model),
         "prompt": prompt,
+        "token_ids": token_ids,
+        "tokenizer_source": tokenizer_source,
         "script": os.path.abspath(__file__),
         "gguf": {
             "version": 3,
@@ -418,7 +703,12 @@ def main():
             "arch": arch, "n_layer": n_layer, "n_embd": n_embd,
             "n_head": n_head, "n_head_kv": n_head_kv, "n_ff": n_ff,
             "rms_eps": eps, "n_ctx": n_ctx, "vocab": vocab,
+            "rope_theta": rope_theta,
+            "tie_word_embeddings": "output.weight" not in tensors_by_name,
+            "model_layers": cfg.num_hidden_layers,
         },
+        "mapped_parameters": sorted(written),
+        "outputs": hashes,
         "tensor_types": {
             TYPE_NAMES.get(t["type"], str(t["type"])): 0 for t in tensors
         },
@@ -431,7 +721,6 @@ def main():
         json.dump(manifest, fh, indent=2, ensure_ascii=False)
 
     print("wrote %s" % os.path.join(args.out, "manifest.json"))
-    print("NOTE: forward pass not implemented yet; no logits produced.")
     return 0
 
 
